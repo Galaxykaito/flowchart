@@ -25,6 +25,11 @@ const projectManagerRef = ref(null)
 const autoSaveTimer = ref(null)
 const saveStatus = ref('已保存')
 
+// 工作区管理（新架构）
+const workspaceHandle = ref(null)  // 工作区文件夹句柄
+const workspaceName = ref(localStorage.getItem('workspace-name') || '')
+const isFileSystemSupported = ref('showDirectoryPicker' in window)
+
 // 命名弹窗
 const showNameModal = ref(false)
 const pendingProjectAction = ref(null) // 'create' | 'rename'
@@ -40,6 +45,14 @@ const canvasColorPresets = [
   { name: '电脑管家', color: '#CCE8CF' },
   { name: '极光灰', color: '#EAEAEF' },
 ]
+
+// 注释 tooltip
+const annotationTooltip = ref({
+  visible: false,
+  content: '',
+  x: 0,
+  y: 0
+})
 
 // 提供给子组件
 provide('lf', lf)
@@ -105,6 +118,9 @@ onMounted(async () => {
     // 启动自动保存
     startAutoSave()
     
+    // 尝试恢复工作区
+    restoreWorkspace()
+    
     // 应用保存的画布颜色
     applyCanvasColor(canvasColor.value)
 
@@ -160,8 +176,31 @@ function setupEventListeners() {
   lf.value.on('history:change', () => {
     saveStatus.value = '未保存'
   })
+  
+  // 鼠标悬停显示注释
+  lf.value.on('node:mouseenter', ({ data, e }) => {
+    const annotations = data.properties?.annotations
+    if (annotations && annotations.length > 0) {
+      // 显示所有注释，用换行分隔
+      const content = annotations.map((note, index) => 
+        `#${index + 1} ${note.content}`
+      ).join('\n')
+      
+      annotationTooltip.value = {
+        visible: true,
+        content: content,
+        x: e.clientX + 10,
+        y: e.clientY + 10
+      }
+    }
+  })
+  
+  lf.value.on('node:mouseleave', () => {
+    annotationTooltip.value.visible = false
+  })
 }
 
+// 更新 tooltip 位置（相对于节点）
 // 渲染初始数据
 function renderInitialData() {
   if (!lf.value) return
@@ -358,7 +397,7 @@ function createNewProject(name = '', showPrompt = false) {
 }
 
 // 实际创建项目
-function doCreateProject(projectName) {
+async function doCreateProject(projectName) {
   const newProject = {
     id: Date.now().toString(),
     name: projectName,
@@ -367,15 +406,65 @@ function doCreateProject(projectName) {
     data: { nodes: [], edges: [] }
   }
   
-  // 保存到项目列表
-  const projectsStr = localStorage.getItem('flowchart-projects')
-  const projects = projectsStr ? JSON.parse(projectsStr) : []
-  projects.unshift(newProject)
-  localStorage.setItem('flowchart-projects', JSON.stringify(projects))
+  // 如果有工作区，创建项目文件夹
+  if (workspaceHandle.value) {
+    try {
+      // 创建项目文件夹
+      const folderName = `${projectName}_${newProject.id}`
+      const projectFolder = await workspaceHandle.value.getDirectoryHandle(folderName, { create: true })
+      
+      // 创建 images 子文件夹
+      await projectFolder.getDirectoryHandle('images', { create: true })
+      
+      // 保存 flow.json
+      const flowFile = await projectFolder.getFileHandle('flow.json', { create: true })
+      const writable = await flowFile.createWritable()
+      await writable.write(JSON.stringify(newProject, null, 2))
+      await writable.close()
+      
+      newProject.folderName = folderName
+      newProject.projectFolder = projectFolder  // 保存句柄引用（不会序列化）
+      
+      console.log(`项目文件夹已创建: ${folderName}`)
+    } catch (err) {
+      console.error('创建项目文件夹失败:', err)
+      alert('创建项目文件夹失败，将仅保存在浏览器中')
+    }
+  }
+  
+  // 保存到项目列表（localStorage 作为缓存）
+  try {
+    const projectsStr = localStorage.getItem('flowchart-projects')
+    const projects = projectsStr ? JSON.parse(projectsStr) : []
+    
+    // 如果有工作区，只存元信息
+    const saveData = workspaceHandle.value 
+      ? {
+          id: newProject.id,
+          name: newProject.name,
+          folderName: newProject.folderName,
+          createdAt: newProject.createdAt,
+          updatedAt: newProject.updatedAt
+        }
+      : newProject  // 无工作区时存完整数据
+    
+    projects.unshift(saveData)
+    localStorage.setItem('flowchart-projects', JSON.stringify(projects))
+  } catch (err) {
+    if (err.name === 'QuotaExceededError') {
+      console.warn('localStorage 已满')
+      // 不影响工作区模式
+    }
+  }
   
   // 设置为当前项目
   currentProject.value = newProject
   localStorage.setItem('flowchart-last-project', newProject.id)
+  
+  // 设置图片节点的当前项目文件夹
+  if (newProject.projectFolder) {
+    window.__flowchartCurrentProjectFolder = newProject.projectFolder
+  }
   
   // 清空画布
   lf.value?.clearData()
@@ -443,25 +532,311 @@ function deleteProject(projectId) {
 }
 
 // 保存当前项目
-function saveCurrentProject() {
+async function saveCurrentProject() {
   if (!currentProject.value || !lf.value) return
   
   const data = lf.value.getGraphData()
   currentProject.value.data = data
   currentProject.value.updatedAt = Date.now()
   
-  // 更新项目列表
-  const projectsStr = localStorage.getItem('flowchart-projects')
-  if (projectsStr) {
-    const projects = JSON.parse(projectsStr)
-    const index = projects.findIndex(p => p.id === currentProject.value.id)
-    if (index >= 0) {
-      projects[index] = currentProject.value
-      localStorage.setItem('flowchart-projects', JSON.stringify(projects))
+  // 保存到工作区（优先）
+  if (workspaceHandle.value && currentProject.value.folderName) {
+    try {
+      await saveProjectToWorkspace()
+      saveStatus.value = '已保存'
+      
+      // 工作区保存成功，只缓存项目元信息到 localStorage
+      saveLightweightCache()
+      return
+    } catch (err) {
+      console.error('保存到工作区失败:', err)
     }
   }
   
-  saveStatus.value = '已保存'
+  // 没有工作区或保存失败，尝试保存到 localStorage（可能失败）
+  try {
+    const projectsStr = localStorage.getItem('flowchart-projects')
+    if (projectsStr) {
+      const projects = JSON.parse(projectsStr)
+      const index = projects.findIndex(p => p.id === currentProject.value.id)
+      if (index >= 0) {
+        projects[index] = currentProject.value
+        localStorage.setItem('flowchart-projects', JSON.stringify(projects))
+      }
+    }
+    saveStatus.value = '已保存'
+  } catch (err) {
+    if (err.name === 'QuotaExceededError') {
+      console.warn('localStorage 已满，建议设置工作区')
+      alert('浏览器存储空间不足！\n\n建议点击"设置工作区"将项目保存到本地文件夹。')
+      saveStatus.value = '存储已满'
+    } else {
+      console.error('保存失败:', err)
+      saveStatus.value = '保存失败'
+    }
+  }
+}
+
+// 保存轻量级缓存（只存元信息，不存完整数据）
+function saveLightweightCache() {
+  try {
+    const projectsStr = localStorage.getItem('flowchart-projects')
+    const projects = projectsStr ? JSON.parse(projectsStr) : []
+    
+    // 只保存项目元信息
+    const lightProject = {
+      id: currentProject.value.id,
+      name: currentProject.value.name,
+      folderName: currentProject.value.folderName,
+      createdAt: currentProject.value.createdAt,
+      updatedAt: currentProject.value.updatedAt,
+      // 不保存 data，减少存储压力
+    }
+    
+    const index = projects.findIndex(p => p.id === currentProject.value.id)
+    if (index >= 0) {
+      projects[index] = lightProject
+    } else {
+      projects.unshift(lightProject)
+    }
+    
+    localStorage.setItem('flowchart-projects', JSON.stringify(projects))
+  } catch (err) {
+    console.warn('缓存元信息失败:', err)
+    // 不影响主流程
+  }
+}
+
+// 保存项目到工作区
+async function saveProjectToWorkspace() {
+  if (!workspaceHandle.value || !currentProject.value.folderName) return
+  
+  try {
+    // 获取项目文件夹
+    const projectFolder = await workspaceHandle.value.getDirectoryHandle(currentProject.value.folderName)
+    
+    // 保存 flow.json
+    const flowFile = await projectFolder.getFileHandle('flow.json', { create: true })
+    const writable = await flowFile.createWritable()
+    
+    // 准备保存的数据（移除不可序列化的属性）
+    const { projectFolder: _, ...saveData } = currentProject.value
+    await writable.write(JSON.stringify(saveData, null, 2))
+    await writable.close()
+    
+    console.log(`项目已保存: ${currentProject.value.folderName}/flow.json`)
+  } catch (err) {
+    console.error('保存项目到工作区失败:', err)
+    throw err
+  }
+}
+
+// ==================== 工作区管理（新架构）====================
+
+// 恢复工作区（启动时调用）
+async function restoreWorkspace() {
+  const savedName = localStorage.getItem('workspace-name')
+  if (!savedName || !isFileSystemSupported.value) return
+  
+  try {
+    // 使用 IndexedDB 存储的句柄
+    const db = await openWorkspaceDB()
+    const handle = await getStoredWorkspaceHandle(db)
+    
+    if (handle) {
+      // 请求权限
+      const permission = await handle.queryPermission({ mode: 'readwrite' })
+      
+      if (permission === 'granted') {
+        // 权限已授予，直接使用
+        workspaceHandle.value = handle
+        workspaceName.value = handle.name
+        window.__flowchartWorkspace = handle
+        
+        console.log(`工作区已恢复: ${handle.name}`)
+        
+        // 加载项目
+        await loadProjectsFromWorkspace()
+      } else {
+        // 权限未授予，尝试请求
+        const newPermission = await handle.requestPermission({ mode: 'readwrite' })
+        
+        if (newPermission === 'granted') {
+          workspaceHandle.value = handle
+          workspaceName.value = handle.name
+          window.__flowchartWorkspace = handle
+          
+          console.log(`工作区权限已重新授予: ${handle.name}`)
+          await loadProjectsFromWorkspace()
+        } else {
+          console.log('工作区权限未授予，需要重新选择')
+          clearWorkspace()
+        }
+      }
+    }
+  } catch (err) {
+    console.error('恢复工作区失败:', err)
+    // 失败时不影响正常使用
+  }
+}
+
+// 打开 IndexedDB
+function openWorkspaceDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('FlowchartWorkspace', 1)
+    
+    request.onerror = () => reject(request.error)
+    request.onsuccess = () => resolve(request.result)
+    
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result
+      if (!db.objectStoreNames.contains('handles')) {
+        db.createObjectStore('handles')
+      }
+    }
+  })
+}
+
+// 获取存储的工作区句柄
+function getStoredWorkspaceHandle(db) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['handles'], 'readonly')
+    const store = transaction.objectStore('handles')
+    const request = store.get('workspace')
+    
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+}
+
+// 存储工作区句柄
+async function storeWorkspaceHandle(handle) {
+  try {
+    const db = await openWorkspaceDB()
+    const transaction = db.transaction(['handles'], 'readwrite')
+    const store = transaction.objectStore('handles')
+    
+    await new Promise((resolve, reject) => {
+      const request = store.put(handle, 'workspace')
+      request.onsuccess = () => resolve()
+      request.onerror = () => reject(request.error)
+    })
+    
+    console.log('工作区句柄已存储')
+  } catch (err) {
+    console.error('存储工作区句柄失败:', err)
+  }
+}
+
+// 选择工作区文件夹
+async function selectWorkspace() {
+  if (!isFileSystemSupported.value) {
+    alert('您的浏览器不支持文件系统访问 API，建议使用 Chrome/Edge 浏览器')
+    return
+  }
+  
+  try {
+    const dirHandle = await window.showDirectoryPicker({
+      mode: 'readwrite',
+      startIn: 'documents'
+    })
+    
+    workspaceHandle.value = dirHandle
+    workspaceName.value = dirHandle.name
+    localStorage.setItem('workspace-name', dirHandle.name)
+    
+    // 设置全局访问（供图片节点使用）
+    window.__flowchartWorkspace = dirHandle
+    
+    // 存储句柄到 IndexedDB（持久化）
+    await storeWorkspaceHandle(dirHandle)
+    
+    alert(`工作区已设置: ${dirHandle.name}\n\n所有项目将保存在此文件夹下\n下次启动会自动恢复`)
+    
+    // 加载工作区内的所有项目
+    await loadProjectsFromWorkspace()
+    
+    // 如果没有项目，引导创建
+    if (!currentProject.value) {
+      const createNew = confirm('工作区内没有项目，是否创建第一个项目？')
+      if (createNew) {
+        createNewProject('', true)
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      console.error('选择工作区失败:', err)
+    }
+  }
+}
+
+// 从工作区加载所有项目
+async function loadProjectsFromWorkspace() {
+  if (!workspaceHandle.value) return
+  
+  try {
+    const projects = []
+    
+    // 遍历工作区内的所有子文件夹
+    for await (const entry of workspaceHandle.value.values()) {
+      if (entry.kind === 'directory') {
+        try {
+          // 尝试读取 flow.json
+          const projectHandle = await workspaceHandle.value.getDirectoryHandle(entry.name)
+          const flowFile = await projectHandle.getFileHandle('flow.json')
+          const file = await flowFile.getFile()
+          const content = await file.text()
+          const projectData = JSON.parse(content)
+          
+          // 添加项目
+          projects.push({
+            ...projectData,
+            folderName: entry.name  // 记录文件夹名
+          })
+        } catch (err) {
+          // 没有 flow.json 的文件夹跳过
+          console.log(`跳过文件夹: ${entry.name}`)
+        }
+      }
+    }
+    
+    if (projects.length > 0) {
+      // 更新 localStorage（兼容旧版项目管理器）
+      localStorage.setItem('flowchart-projects', JSON.stringify(projects))
+      
+      // 加载第一个项目
+      await loadProject(projects[0])
+      
+      // 刷新项目管理器
+      if (projectManagerRef.value) {
+        projectManagerRef.value.loadProjects()
+      }
+      
+      console.log(`已从工作区加载 ${projects.length} 个项目`)
+    }
+  } catch (err) {
+    console.error('从工作区加载项目失败:', err)
+  }
+}
+
+// 清除工作区关联
+async function clearWorkspace() {
+  workspaceHandle.value = null
+  workspaceName.value = ''
+  localStorage.removeItem('workspace-name')
+  window.__flowchartWorkspace = null
+  
+  // 清除 IndexedDB 中的句柄
+  try {
+    const db = await openWorkspaceDB()
+    const transaction = db.transaction(['handles'], 'readwrite')
+    const store = transaction.objectStore('handles')
+    store.delete('workspace')
+  } catch (err) {
+    console.error('清除存储的句柄失败:', err)
+  }
+  
+  alert('已清除工作区，项目将仅保存在浏览器中')
 }
 
 // 启动自动保存
@@ -513,6 +888,20 @@ function loadFromLocal() {
       <PropertyPanel :element="selectedElement" />
     </main>
 
+    <!-- 注释 tooltip -->
+    <Teleport to="body">
+      <div 
+        v-if="annotationTooltip.visible" 
+        class="annotation-tooltip"
+        :style="{
+          left: annotationTooltip.x + 'px',
+          top: annotationTooltip.y + 'px'
+        }"
+      >
+        {{ annotationTooltip.content }}
+      </div>
+    </Teleport>
+
     <!-- 底部状态栏 -->
     <footer class="status-bar">
       <div class="status-left">
@@ -543,6 +932,25 @@ function loadFromLocal() {
         </span>
       </div>
       <div class="status-right">
+        <!-- 工作区 -->
+        <div class="folder-manager">
+          <button 
+            v-if="!workspaceHandle" 
+            class="folder-btn" 
+            @click="selectWorkspace"
+            :title="isFileSystemSupported ? '设置工作区文件夹' : '您的浏览器不支持此功能'"
+            :disabled="!isFileSystemSupported"
+          >
+            <span>📂</span>
+            <span>设置工作区</span>
+          </button>
+          <div v-else class="folder-info">
+            <span class="folder-icon">📂</span>
+            <span class="folder-name">{{ workspaceName || '工作区' }}</span>
+            <button class="folder-clear" @click="clearWorkspace" title="清除工作区">×</button>
+          </div>
+        </div>
+        
         <!-- 画布颜色设置 -->
         <div class="canvas-color-picker">
           <button class="color-trigger" @click="showCanvasColorPicker = !showCanvasColorPicker">
@@ -755,6 +1163,99 @@ body {
   color: rgba(255, 255, 255, 0.5);
 }
 
+/* 本地文件夹管理 */
+.folder-manager {
+  margin-right: 12px;
+}
+
+.folder-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  background: rgba(52, 211, 153, 0.15);
+  border: 1px solid rgba(52, 211, 153, 0.3);
+  border-radius: 16px;
+  color: rgba(52, 211, 153, 0.9);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.folder-btn:hover:not(:disabled) {
+  background: rgba(52, 211, 153, 0.25);
+  border-color: rgba(52, 211, 153, 0.5);
+  transform: translateY(-1px);
+}
+
+.folder-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.folder-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: rgba(52, 211, 153, 0.15);
+  border: 1px solid rgba(52, 211, 153, 0.3);
+  border-radius: 16px;
+  font-size: 11px;
+}
+
+.folder-icon {
+  font-size: 12px;
+}
+
+.folder-name {
+  color: rgba(52, 211, 153, 0.9);
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-sync {
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(52, 211, 153, 0.2);
+  border: none;
+  border-radius: 50%;
+  color: rgba(52, 211, 153, 0.9);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.folder-sync:hover {
+  background: rgba(52, 211, 153, 0.3);
+  transform: rotate(180deg);
+}
+
+.folder-clear {
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 77, 79, 0.2);
+  border: none;
+  border-radius: 50%;
+  color: #ff4d4f;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.folder-clear:hover {
+  background: #ff4d4f;
+  color: white;
+}
+
 /* 画布颜色选择器 */
 .canvas-color-picker {
   position: relative;
@@ -891,6 +1392,47 @@ body {
 @keyframes pulse-warning {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.6; }
+}
+
+/* 注释 tooltip */
+.annotation-tooltip {
+  position: fixed;
+  z-index: 10000;
+  max-width: 300px;
+  padding: 10px 14px;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1.6;
+  border-radius: 8px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+  animation: tooltipFadeIn 0.2s ease;
+}
+
+.annotation-tooltip::before {
+  content: '';
+  position: absolute;
+  top: -6px;
+  left: 10px;
+  width: 0;
+  height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-bottom: 6px solid #667eea;
+}
+
+@keyframes tooltipFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* 小地图 - 移动到右下角并缩小 */
