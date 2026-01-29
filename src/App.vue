@@ -112,14 +112,14 @@ onMounted(async () => {
     // 设置事件监听
     setupEventListeners()
 
-    // 加载上次的项目或初始数据
-    loadLastProject()
-
     // 启动自动保存
     startAutoSave()
     
-    // 尝试恢复工作区
-    restoreWorkspace()
+    // 尝试恢复工作区（必须在加载项目之前）
+    await restoreWorkspace()
+    
+    // 加载上次的项目或初始数据（工作区恢复后执行）
+    await loadLastProject()
     
     // 应用保存的画布颜色
     applyCanvasColor(canvasColor.value)
@@ -315,22 +315,152 @@ function importJSON() {
   const input = document.createElement('input')
   input.type = 'file'
   input.accept = '.json'
-  input.onchange = (e) => {
+  input.onchange = async (e) => {
     const file = e.target.files?.[0]
     if (!file) return
+    
     const reader = new FileReader()
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       try {
-        lf.value?.render(JSON.parse(event.target.result))
-        updateGraphData()
-        alert('导入成功！')
+        const importedData = JSON.parse(event.target.result)
+        
+        // 检查是否是完整项目数据（包含 id, name 等）
+        if (importedData.id && importedData.name && importedData.data) {
+          // 导入完整项目
+          await importFullProject(importedData, file.name)
+        } else {
+          // 只是流程图数据，渲染到当前项目
+          lf.value?.render(importedData)
+          updateGraphData()
+          
+          // 如果有工作区，提示保存
+          if (workspaceHandle.value && currentProject.value) {
+            await saveCurrentProject()
+          }
+          
+          alert('导入成功！')
+        }
       } catch (e) {
-        alert('导入失败')
+        console.error('导入失败:', e)
+        alert('导入失败：' + e.message)
       }
     }
     reader.readAsText(file)
   }
   input.click()
+}
+
+// 导入完整项目
+async function importFullProject(projectData, fileName = '') {
+  // 从文件名提取项目名（去掉 .json 后缀）
+  let projectName = projectData.name || '未命名项目'
+  
+  if (fileName && !projectData.name) {
+    // 如果项目没有名称，从文件名提取
+    projectName = fileName.replace(/\.json$/i, '')
+  }
+  
+  // 生成新 ID 避免冲突
+  const newProject = {
+    ...projectData,
+    id: Date.now().toString(),
+    name: projectName,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  }
+  
+  // 检查是否有图片节点
+  const hasImageNodes = newProject.data?.nodes?.some(node => 
+    node.type === 'image-node' && node.properties?.isLocalFile
+  )
+  
+  if (hasImageNodes && workspaceHandle.value) {
+    // 提示用户关于图片的问题
+    alert(
+      '⚠️ 检测到该项目包含图片节点\n\n' +
+      '导入后图片将显示为缺失状态。\n\n' +
+      '解决方法：\n' +
+      '1. 导入项目后，在图片节点上双击重新上传图片\n' +
+      '2. 或手动将图片复制到项目的 images 文件夹中'
+    )
+  }
+  
+  // 创建项目（不自动导入图片）
+  await createProjectInWorkspace(newProject)
+}
+
+// 在工作区创建项目（不含图片）
+async function createProjectInWorkspace(newProject) {
+  if (workspaceHandle.value) {
+    try {
+      const folderName = `${newProject.name}_${newProject.id}`
+      const projectFolder = await workspaceHandle.value.getDirectoryHandle(folderName, { create: true })
+      
+      // 创建 images 子文件夹
+      await projectFolder.getDirectoryHandle('images', { create: true })
+      
+      // 保存 flow.json
+      const flowFile = await projectFolder.getFileHandle('flow.json', { create: true })
+      const writable = await flowFile.createWritable()
+      await writable.write(JSON.stringify(newProject, null, 2))
+      await writable.close()
+      
+      newProject.folderName = folderName
+      newProject.projectFolder = projectFolder
+      
+      console.log(`导入项目已创建文件夹: ${folderName}`)
+    } catch (err) {
+      console.error('创建项目文件夹失败:', err)
+    }
+  }
+  
+  await finishProjectImport(newProject)
+}
+
+// 完成项目导入（公共部分）
+async function finishProjectImport(newProject) {
+  // 添加到项目列表
+  try {
+    const projectsStr = localStorage.getItem('flowchart-projects')
+    const projects = projectsStr ? JSON.parse(projectsStr) : []
+    
+    const saveData = workspaceHandle.value 
+      ? {
+          id: newProject.id,
+          name: newProject.name,
+          folderName: newProject.folderName,
+          createdAt: newProject.createdAt,
+          updatedAt: newProject.updatedAt,
+          nodeCount: newProject.data?.nodes?.length || 0,
+          edgeCount: newProject.data?.edges?.length || 0,
+        }
+      : newProject
+    
+    projects.unshift(saveData)
+    localStorage.setItem('flowchart-projects', JSON.stringify(projects))
+  } catch (err) {
+    console.warn('保存到 localStorage 失败:', err)
+  }
+  
+  // 加载项目
+  currentProject.value = newProject
+  localStorage.setItem('flowchart-last-project', newProject.id)
+  
+  if (newProject.projectFolder) {
+    window.__flowchartCurrentProjectFolder = newProject.projectFolder
+  }
+  
+  if (newProject.data && lf.value) {
+    lf.value.render(newProject.data)
+    updateGraphData()
+  }
+  
+  // 刷新项目管理器
+  projectManagerRef.value?.loadProjects()
+  
+  if (!newProject.folderName) {
+    alert(`项目 "${newProject.name}" 导入成功！`)
+  }
 }
 
 // ========== 画布颜色 ==========
@@ -364,19 +494,28 @@ function updateCanvasColorCustom(e) {
 // ========== 项目管理 ==========
 
 // 加载上次的项目
-function loadLastProject() {
+async function loadLastProject() {
   const lastProjectId = localStorage.getItem('flowchart-last-project')
   const projectsStr = localStorage.getItem('flowchart-projects')
   
   if (lastProjectId && projectsStr) {
     const projects = JSON.parse(projectsStr)
-    const project = projects.find(p => p.id === lastProjectId)
-    if (project && project.data) {
-      currentProject.value = project
-      lf.value?.render(project.data)
-      updateGraphData()
-      setTimeout(() => lf.value?.translateCenter(), 100)
-      return
+    const projectMeta = projects.find(p => p.id === lastProjectId)
+    
+    if (projectMeta) {
+      // 检查是否是工作区项目（有 folderName）
+      if (projectMeta.folderName && workspaceHandle.value) {
+        // 从工作区加载完整数据
+        await loadProjectById(lastProjectId, null)
+        return
+      } else if (projectMeta.data) {
+        // 旧版本，直接从 localStorage 加载
+        currentProject.value = projectMeta
+        lf.value?.render(projectMeta.data)
+        updateGraphData()
+        setTimeout(() => lf.value?.translateCenter(), 100)
+        return
+      }
     }
   }
   
@@ -486,13 +625,22 @@ function handleNameConfirm(name) {
 }
 
 // 选择项目
-function selectProject(project) {
+async function selectProject(project) {
   if (!project) return
   
   // 先保存当前项目
-  saveCurrentProject()
+  if (currentProject.value) {
+    await saveCurrentProject()
+  }
   
-  // 加载选中的项目
+  // 如果是工作区项目（有 folderName），从文件系统加载
+  if (project.folderName && workspaceHandle.value) {
+    await loadProjectById(project.id, null)
+    showProjectManager.value = false
+    return
+  }
+  
+  // 加载选中的项目（localStorage 模式）
   currentProject.value = project
   localStorage.setItem('flowchart-last-project', project.id)
   
@@ -511,18 +659,35 @@ function selectProject(project) {
 }
 
 // 删除项目
-function deleteProject(projectId) {
+async function deleteProject(projectId) {
   const projectsStr = localStorage.getItem('flowchart-projects')
   if (!projectsStr) return
   
   let projects = JSON.parse(projectsStr)
+  const targetProject = projects.find(p => p.id === projectId)
+  
+  // 如果是工作区项目，删除文件夹
+  if (targetProject?.folderName && workspaceHandle.value) {
+    try {
+      await workspaceHandle.value.removeEntry(targetProject.folderName, { recursive: true })
+      console.log(`已删除项目文件夹: ${targetProject.folderName}`)
+    } catch (err) {
+      console.error('删除项目文件夹失败:', err)
+      alert('删除项目文件夹失败，但已从列表中移除')
+    }
+  }
+  
+  // 从列表中移除
   projects = projects.filter(p => p.id !== projectId)
   localStorage.setItem('flowchart-projects', JSON.stringify(projects))
   
   // 如果删除的是当前项目，切换到其他项目或创建新项目
   if (currentProject.value?.id === projectId) {
+    // 先清空当前项目，避免自动保存到已删除的文件夹
+    currentProject.value = null
+    
     if (projects.length > 0) {
-      selectProject(projects[0])
+      await selectProject(projects[0])
     } else {
       createNewProject('未命名作品', false)
     }
@@ -590,7 +755,9 @@ function saveLightweightCache() {
       folderName: currentProject.value.folderName,
       createdAt: currentProject.value.createdAt,
       updatedAt: currentProject.value.updatedAt,
-      // 不保存 data，减少存储压力
+      // 添加统计信息（供项目卡片显示）
+      nodeCount: currentProject.value.data?.nodes?.length || 0,
+      edgeCount: currentProject.value.data?.edges?.length || 0,
     }
     
     const index = projects.findIndex(p => p.id === currentProject.value.id)
@@ -633,6 +800,54 @@ async function saveProjectToWorkspace() {
 
 // ==================== 工作区管理（新架构）====================
 
+// 同步项目列表（只更新 localStorage，不加载项目）
+async function syncProjectListFromWorkspace() {
+  if (!workspaceHandle.value) return
+  
+  try {
+    const projects = []
+    
+    // 遍历工作区内的所有子文件夹
+    for await (const entry of workspaceHandle.value.values()) {
+      if (entry.kind === 'directory') {
+        try {
+          // 尝试读取 flow.json
+          const projectHandle = await workspaceHandle.value.getDirectoryHandle(entry.name)
+          const flowFile = await projectHandle.getFileHandle('flow.json')
+          const file = await flowFile.getFile()
+          const content = await file.text()
+          const projectData = JSON.parse(content)
+          
+          // 只保存元信息
+          projects.push({
+            id: projectData.id,
+            name: projectData.name,
+            folderName: entry.name,
+            createdAt: projectData.createdAt,
+            updatedAt: projectData.updatedAt,
+            nodeCount: projectData.data?.nodes?.length || 0,
+            edgeCount: projectData.data?.edges?.length || 0,
+          })
+        } catch (err) {
+          // 没有 flow.json 的文件夹跳过
+          console.log(`跳过文件夹: ${entry.name}`)
+        }
+      }
+    }
+    
+    if (projects.length > 0) {
+      // 替换 localStorage（只保留工作区项目）
+      localStorage.setItem('flowchart-projects', JSON.stringify(projects))
+      console.log(`已同步 ${projects.length} 个项目`)
+    } else {
+      // 工作区没有项目，清空列表
+      localStorage.setItem('flowchart-projects', JSON.stringify([]))
+    }
+  } catch (err) {
+    console.error('同步项目列表失败:', err)
+  }
+}
+
 // 恢复工作区（启动时调用）
 async function restoreWorkspace() {
   const savedName = localStorage.getItem('workspace-name')
@@ -644,7 +859,7 @@ async function restoreWorkspace() {
     const handle = await getStoredWorkspaceHandle(db)
     
     if (handle) {
-      // 请求权限
+      // 检查权限（不自动请求）
       const permission = await handle.queryPermission({ mode: 'readwrite' })
       
       if (permission === 'granted') {
@@ -655,23 +870,45 @@ async function restoreWorkspace() {
         
         console.log(`工作区已恢复: ${handle.name}`)
         
-        // 加载项目
-        await loadProjectsFromWorkspace()
-      } else {
-        // 权限未授予，尝试请求
-        const newPermission = await handle.requestPermission({ mode: 'readwrite' })
+        // 更新 localStorage 中的项目列表（但不加载项目）
+        await syncProjectListFromWorkspace()
         
-        if (newPermission === 'granted') {
-          workspaceHandle.value = handle
-          workspaceName.value = handle.name
-          window.__flowchartWorkspace = handle
-          
-          console.log(`工作区权限已重新授予: ${handle.name}`)
-          await loadProjectsFromWorkspace()
-        } else {
-          console.log('工作区权限未授予，需要重新选择')
-          clearWorkspace()
+        // 刷新项目管理器显示
+        if (projectManagerRef.value) {
+          projectManagerRef.value.loadProjects()
         }
+      } else {
+        // 权限未授予，提示用户
+        console.log('工作区权限已过期，请重新授权')
+        
+        // 显示提示（不自动请求，避免 SecurityError）
+        setTimeout(() => {
+          const reauth = confirm(
+            `上次的工作区 "${savedName}" 需要重新授权。\n\n` +
+            '是否现在重新授权？\n（或点击状态栏的"设置工作区"按钮）'
+          )
+          
+          if (reauth) {
+            // 用户点击确定，请求权限
+            handle.requestPermission({ mode: 'readwrite' }).then(newPermission => {
+              if (newPermission === 'granted') {
+                workspaceHandle.value = handle
+                workspaceName.value = handle.name
+                window.__flowchartWorkspace = handle
+                
+                console.log('工作区权限已重新授予')
+                syncProjectListFromWorkspace()
+              } else {
+                clearWorkspace()
+              }
+            }).catch(err => {
+              console.error('请求权限失败:', err)
+              clearWorkspace()
+            })
+          } else {
+            clearWorkspace()
+          }
+        }, 1000)  // 延迟显示，避免页面加载时弹窗
       }
     }
   } catch (err) {
@@ -791,7 +1028,8 @@ async function loadProjectsFromWorkspace() {
           // 添加项目
           projects.push({
             ...projectData,
-            folderName: entry.name  // 记录文件夹名
+            folderName: entry.name,  // 记录文件夹名
+            projectFolder: projectHandle  // 保存句柄引用
           })
         } catch (err) {
           // 没有 flow.json 的文件夹跳过
@@ -802,10 +1040,17 @@ async function loadProjectsFromWorkspace() {
     
     if (projects.length > 0) {
       // 更新 localStorage（兼容旧版项目管理器）
-      localStorage.setItem('flowchart-projects', JSON.stringify(projects))
+      const lightProjects = projects.map(p => ({
+        id: p.id,
+        name: p.name,
+        folderName: p.folderName,
+        createdAt: p.createdAt,
+        updatedAt: p.updatedAt
+      }))
+      localStorage.setItem('flowchart-projects', JSON.stringify(lightProjects))
       
       // 加载第一个项目
-      await loadProject(projects[0])
+      await loadProjectById(projects[0].id, projects[0])
       
       // 刷新项目管理器
       if (projectManagerRef.value) {
@@ -816,6 +1061,59 @@ async function loadProjectsFromWorkspace() {
     }
   } catch (err) {
     console.error('从工作区加载项目失败:', err)
+  }
+}
+
+// 加载指定项目
+async function loadProjectById(projectId, projectData = null) {
+  try {
+    let project = projectData
+    
+    // 如果没有提供数据，从工作区读取
+    if (!project && workspaceHandle.value) {
+      const projectsStr = localStorage.getItem('flowchart-projects')
+      if (projectsStr) {
+        const projects = JSON.parse(projectsStr)
+        const projectMeta = projects.find(p => p.id === projectId)
+        
+        if (projectMeta && projectMeta.folderName) {
+          // 从工作区读取
+          const projectFolder = await workspaceHandle.value.getDirectoryHandle(projectMeta.folderName)
+          const flowFile = await projectFolder.getFileHandle('flow.json')
+          const file = await flowFile.getFile()
+          const content = await file.text()
+          project = {
+            ...JSON.parse(content),
+            folderName: projectMeta.folderName,
+            projectFolder: projectFolder
+          }
+        }
+      }
+    }
+    
+    if (!project) {
+      console.error('项目不存在:', projectId)
+      return
+    }
+    
+    // 设置为当前项目
+    currentProject.value = project
+    localStorage.setItem('flowchart-last-project', project.id)
+    
+    // 设置图片节点的当前项目文件夹
+    if (project.projectFolder) {
+      window.__flowchartCurrentProjectFolder = project.projectFolder
+    }
+    
+    // 渲染数据
+    if (project.data && lf.value) {
+      lf.value.render(project.data)
+      updateGraphData()
+    }
+    
+    console.log(`已加载项目: ${project.name}`)
+  } catch (err) {
+    console.error('加载项目失败:', err)
   }
 }
 

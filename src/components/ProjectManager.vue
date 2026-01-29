@@ -17,7 +17,18 @@ onMounted(() => {
 function loadProjects() {
   const saved = localStorage.getItem('flowchart-projects')
   if (saved) {
-    projects.value = JSON.parse(saved)
+    const allProjects = JSON.parse(saved)
+    
+    // 检查是否有工作区
+    const workspaceName = localStorage.getItem('workspace-name')
+    
+    if (workspaceName) {
+      // 工作区模式：只显示有 folderName 的项目
+      projects.value = allProjects.filter(p => p.folderName)
+    } else {
+      // localStorage 模式：只显示有 data 的项目（没有 folderName）
+      projects.value = allProjects.filter(p => !p.folderName)
+    }
   }
 }
 
@@ -49,10 +60,20 @@ function deleteProject(e, project) {
 }
 
 function getNodeCount(project) {
+  // 优先使用缓存的统计信息（工作区模式）
+  if (project.nodeCount !== undefined) {
+    return project.nodeCount
+  }
+  // 降级到从 data 读取（localStorage 模式）
   return project.data?.nodes?.length || 0
 }
 
 function getEdgeCount(project) {
+  // 优先使用缓存的统计信息（工作区模式）
+  if (project.edgeCount !== undefined) {
+    return project.edgeCount
+  }
+  // 降级到从 data 读取（localStorage 模式）
   return project.data?.edges?.length || 0
 }
 
